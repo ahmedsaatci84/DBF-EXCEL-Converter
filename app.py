@@ -3,7 +3,7 @@
 # Developer: Ahmed Abdul Ammer Al-Saatci
 #
 # Two conversion modes:
-#   1. DBF → CSV  : Read dBASE III/IV files and export to comma-separated values.
+#   1. DBF → Excel: Read dBASE III/IV files and export to native .xlsx workbooks.
 #   2. Excel → DBF: Read .xlsx / .xls worksheets and write dBASE III binary files.
 #
 # Arabic encoding reference:
@@ -31,7 +31,7 @@ from dbfread import DBF
 ENCODINGS_TO_TRY = ["cp720", "cp1256", "cp864", "cp1252", "utf-8"]
 
 
-# ─── DBF → CSV helpers ────────────────────────────────────────────────────────
+# ─── DBF → Excel helpers ─────────────────────────────────────────────────────
 
 def read_dbf(path: str) -> pd.DataFrame:
     """
@@ -71,31 +71,43 @@ def _decode_bytes(v):
     return v.decode("cp1256", errors="replace")
 
 
-def convert_dbf_to_csv(dbf_path: str, out_dir: str) -> str:
+def convert_dbf_to_excel(dbf_path: str, out_dir: str) -> str:
     """
-    Convert a single DBF file to a CSV file saved inside out_dir.
+    Convert a single DBF file to a native Excel (.xlsx) workbook saved inside out_dir.
+
+    REFACTOR NOTE (DBF→CSV → DBF→Excel):
+      Previously this function wrote a cp1256-encoded CSV file.  That approach
+      had two problems: Arabic text sometimes mangled when opened on non-Arabic
+      Windows locales, and numeric/date columns lost their type information.
+      Switching to openpyxl's .xlsx writer solves both issues because:
+        • .xlsx uses UTF-8 internally — no encoding parameter needed.
+        • pandas preserves column dtypes (dates become Excel date cells,
+          numbers become numeric cells, etc.) without extra conversion.
 
     Steps:
       1. Read the DBF file (auto-detects encoding via read_dbf).
       2. Decode any raw-bytes columns to Unicode strings.
-      3. Write the result as a cp1256-encoded CSV so Arabic-locale Excel
-         can open the file directly without a BOM or import wizard.
+      3. Write the result as an .xlsx workbook via pandas + openpyxl.
 
-    Returns the absolute path of the newly created CSV file.
+    Returns the absolute path of the newly created .xlsx file.
     """
     df = read_dbf(dbf_path)
 
-    # Decode byte-type columns to proper Unicode strings
+    # Decode byte-type columns to proper Unicode strings.
+    # This step is unchanged from the CSV version — dbfread may return raw
+    # bytes for memo/character fields depending on the source encoding.
     for col in df.columns:
         if df[col].dtype == object:
             df[col] = df[col].apply(_decode_bytes)
 
     base_name = os.path.splitext(os.path.basename(dbf_path))[0]
-    out_path = os.path.join(out_dir, base_name + ".csv")
+    # Changed: output extension is now .xlsx instead of .csv
+    out_path = os.path.join(out_dir, base_name + ".xlsx")
 
-    # cp1256 = Windows Arabic; matches what Arabic-locale Excel expects
-    # when opening a CSV without a BOM.
-    df.to_csv(out_path, index=False, encoding="cp1256", errors="replace")
+    # Changed: use to_excel() with the openpyxl engine instead of to_csv().
+    # index=False omits the pandas row-number column from the worksheet.
+    # No encoding argument is required — .xlsx is always UTF-8.
+    df.to_excel(out_path, index=False, engine="openpyxl")
     return out_path
 
 
@@ -357,7 +369,7 @@ class App(tk.Tk):
     Main window of the DBF ↔ Excel Converter application.
 
     Uses a two-tab ttk.Notebook layout:
-      • Tab 1  "DBF → CSV"   – batch-convert dBASE files to comma-separated values
+      • Tab 1  "DBF → Excel" – batch-convert dBASE files to native .xlsx workbooks
       • Tab 2  "Excel → DBF" – batch-convert Excel worksheets to dBASE III files
 
     All file I/O is executed on background daemon threads so the UI stays
@@ -428,7 +440,7 @@ class App(tk.Tk):
         hdr = ttk.Frame(self, style="TFrame", padding=(PAD * 2, PAD * 2, PAD * 2, PAD))
         hdr.pack(fill="x")
         ttk.Label(hdr, text="DBF ↔ Excel Converter",       style="Header.TLabel").pack(anchor="w")
-        ttk.Label(hdr, text="Convert dBASE files to CSV — or Excel sheets to DBF",
+        ttk.Label(hdr, text="Convert dBASE files to Excel — or Excel sheets to DBF",
                   style="Sub.TLabel").pack(anchor="w")
         ttk.Label(hdr, text="Developer: Ahmed Abdul Ammer Al-Saatci",
                   style="Sub.TLabel").pack(anchor="w")
@@ -439,7 +451,7 @@ class App(tk.Tk):
 
         tab1 = ttk.Frame(self.notebook, style="TFrame", padding=PAD)
         tab2 = ttk.Frame(self.notebook, style="TFrame", padding=PAD)
-        self.notebook.add(tab1, text="  DBF → CSV  ")
+        self.notebook.add(tab1, text="  DBF → Excel  ")
         self.notebook.add(tab2, text="  Excel → DBF  ")
 
         self._build_dbf_tab(tab1, PAD)
@@ -460,12 +472,12 @@ class App(tk.Tk):
 
     def _build_dbf_tab(self, parent: ttk.Frame, pad: int):
         """
-        Populate the 'DBF → CSV' notebook tab.
+        Populate the 'DBF → Excel' notebook tab.
 
         Builds (top to bottom):
           • Labelled panel with a scrollable file listbox and Add/Clear buttons
           • Output-folder selector (entry + Browse button)
-          • 'Convert All  DBF → CSV' button (right-aligned)
+          • 'Convert All  DBF → Excel' button (right-aligned)
 
         Widget handles stored on self:
           self.dbf_listbox  – Listbox showing queued .dbf files
@@ -519,7 +531,7 @@ class App(tk.Tk):
 
         # Convert button ───────────────────────────────────────────────────────
         self.dbf_conv_btn = ttk.Button(
-            parent, text="Convert All  DBF → CSV",
+            parent, text="Convert All  DBF → Excel",
             style="Accent.TButton", command=self._dbf_start_conversion,
         )
         self.dbf_conv_btn.pack(anchor="e")
@@ -656,7 +668,7 @@ class App(tk.Tk):
     def _dbf_start_conversion(self):
         """
         Validate the DBF queue and output folder, then spawn a background thread
-        that calls convert_dbf_to_csv() for every queued file.
+        that calls convert_dbf_to_excel() for every queued file.
         """
         if not self._dbf_files:
             messagebox.showwarning("No files", "Please add at least one DBF file.")
@@ -675,7 +687,11 @@ class App(tk.Tk):
 
     def _dbf_run_conversion(self, files: list, out_dir: str):
         """
-        Worker thread: convert every DBF file in the queue to CSV.
+        Worker thread: convert every DBF file in the queue to Excel (.xlsx).
+
+        REFACTOR NOTE: previously called convert_dbf_to_csv(); now calls
+        convert_dbf_to_excel() so each DBF produces a proper .xlsx workbook
+        instead of a plain-text CSV file.
 
         Updates the shared progress bar and status label after each file via
         the thread-safe _set_status / _set_progress helpers.  Errors are
@@ -691,7 +707,8 @@ class App(tk.Tk):
             name = os.path.basename(path)
             self._set_status(f"Converting {i}/{total}: {name} …")
             try:
-                out = convert_dbf_to_csv(path, out_dir)
+                # Changed: convert_dbf_to_csv → convert_dbf_to_excel
+                out = convert_dbf_to_excel(path, out_dir)
                 converted += 1
                 self._set_status(f"Done {i}/{total}: {name} → {os.path.basename(out)}")
             except Exception as exc:
@@ -703,7 +720,7 @@ class App(tk.Tk):
 
     def _on_dbf_done(self, converted: int, errors: list, out_dir: str):
         """
-        Called on the main thread after DBF→CSV conversion finishes.
+        Called on the main thread after DBF→Excel conversion finishes.
         Re-enables the convert button and shows a success or warning dialog.
         """
         self.dbf_conv_btn.state(["!disabled"])
